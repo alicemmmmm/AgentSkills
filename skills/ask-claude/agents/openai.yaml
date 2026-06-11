@@ -1,0 +1,4 @@
+interface:
+  display_name: "Ask Claude"
+  short_description: "通过 Claude Code CLI 获取独立判断、review、多轮讨论或执行结果。"
+  default_prompt: "Ask Claude through Claude Code CLI for an independent answer, review, multi-round debate, validation, or bounded execution result while keeping the main Codex context minimal."
