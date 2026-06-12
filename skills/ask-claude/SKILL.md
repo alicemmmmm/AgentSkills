@@ -63,10 +63,10 @@ description: Use when the user explicitly asks the current agent to consult Clau
 
 - `ask`：默认新建 Claude 短会话，保持独立判断，避免旧话题污染。
 - `review`：默认新建 Claude 短会话，保持审查结果独立、可复现。
-- `debate`：默认新建 Claude 短会话，并通过显式注入上一轮摘要延续讨论；不要为了省会话而长期复用。
+- `debate`：同一场讨论内默认复用第一轮 Claude session；跨主题或新任务时新建 Claude 短会话，避免长期污染。
 - `execute`：默认新建 Claude 短会话，避免执行上下文、工具状态和旧错误污染后续任务。
 
-只有在用户明确要求连续延续某个已有 Claude 会话时，才显式使用 `--resume <session_id>` 或 `--session-id <uuid>`。
+同一场 `debate` 的第 2 轮和可选第 3 轮默认使用第一轮返回的 `session_id` 执行 `--resume <session_id>`。这样 Claude 能看到完整讨论上下文，同时减少重复 prompt 和会话数量。
 
 用户说“继续刚才的讨论”、“继续上面的”、“你们再讨论下”、“在刚才基础上继续”等表达时，可以自动续接最近一次 `debate` 的 Claude session，但必须同时满足：
 
@@ -76,6 +76,8 @@ description: Use when the user explicitly asks the current agent to consult Clau
 4. 最近只有一个候选 `debate` session；如果有多个候选，不要猜，要求用户指定。
 
 如果新请求明显换主题，即使用了“继续刚才”，也新建 Claude 短会话，并把旧结论摘要显式注入 prompt。
+
+普通 `ask`、`review`、`execute` 不自动续接历史 session。只有用户明确给出 `session_id` 或明确要求恢复某个已有 Claude 会话时，才对这些分支使用 `--resume <session_id>` 或 `--session-id <uuid>`。
 
 ### 会话索引
 
@@ -126,7 +128,7 @@ claude -p --output-format json --permission-mode default "<prompt>"
 ```
 
 `debate` 默认和 `review` 使用同等级权限，重点区别在于它必须是多轮、双向可见的观点交换，而不是一次性征求意见。
-同一次 `debate` 中，优先通过显式注入上一轮摘要延续讨论；仅当用户要求“继续刚才的讨论”且满足 Session 策略中的续接条件时，才自动 `--resume` 最近一次 `debate` session。
+同一次 `debate` 中，第 1 轮新建 session，第 2 轮和可选第 3 轮默认 `--resume` 第 1 轮返回的 `session_id`。prompt 仍要包含本轮争议点和主 Agent 回应，但不需要重复完整上一轮内容。
 
 ### execute
 
@@ -141,7 +143,7 @@ claude -p --output-format json --permission-mode bypassPermissions "<prompt>"
 
 ## Debate 工作流
 
-`debate` 默认两轮，最多三轮：
+`debate` 的普通 `discussion` 默认两轮，最多三轮；`adversarial_debate` 按后文专门轮次规则执行：
 
 1. **主 Agent 立场**：主 Agent 先给出自己的初始判断、理由和保留意见。
 2. **Claude 回应**：Claude 必须针对主 Agent 的立场表态，支持、反对或部分修正，并给出依据。
@@ -153,12 +155,23 @@ claude -p --output-format json --permission-mode bypassPermissions "<prompt>"
 
 - 每轮只讨论一个核心争议主题。
 - 每轮都压缩摘要，不传完整长文。
-- 默认两轮，除非仍有明确核心分歧，否则不要进入第 3 轮。
-- 默认最多三轮，避免空转争论。
+- 普通 `discussion` 默认两轮，除非仍有明确核心分歧，否则不要进入第 3 轮。
+- 普通 `discussion` 默认最多三轮，避免空转争论。
 - 如果某一轮没有产生新的分歧、证据或决策信息，立即停止 `debate`。
-- 超过三轮仍未收敛时，不再继续争论，由主 Agent 直接裁决。
+- 普通 `discussion` 超过三轮仍未收敛时，不再继续争论，由主 Agent 直接裁决。
 - 如果 Claude 没有看到主 Agent 的具体观点，这次调用只能算 `ask` 或 `review`，不能算 `debate`。
-- 第 2 轮和可选第 3 轮必须看见上一轮 Claude 摘要和主 Agent 回应；默认用新短会话加显式摘要，只有满足“继续刚才”的续接条件时才使用 `--resume`。
+- 第 2 轮和可选第 3 轮默认 `--resume` 第 1 轮 Claude session，并补充本轮争议点和主 Agent 回应；如果 `--resume` 失败，再降级为新短会话加显式摘要。
+
+### Adversarial Debate 轮次
+
+`adversarial_debate` 默认 2 轮，普通上限 3 轮。只有当用户明确要求“多辩几轮”、“深入辩论”、“把分歧打透”或类似表达时，最多扩展到 5 轮。
+
+超过第 3 轮后必须遵守：
+
+- 每轮只能处理一个未解决的核心分歧。
+- 不允许引入新论点或新战场。
+- 必须产生新的证据、让步或判断变化，否则立即停止。
+- 第 5 轮后强制收束，由主 Agent 输出倾向性裁决。
 
 建议轮次模板：
 
@@ -243,10 +256,40 @@ Claude 上轮观点摘要：
 
 如果是 `debate`，额外整理出：
 
+- `rounds_trace`
+- `primary_agent_initial_position`
+- `claude_round_1_response`
+- `primary_agent_counter_response`
+- `claude_final_response`
 - `primary_agent_position`
 - `claude_position`
 - `main_disagreement`
 - `resolution`
+
+### Debate 可见性
+
+`debate` 结果默认不仅输出最终结论，还要输出压缩后的讨论过程。主 Agent 汇报时按下面结构组织：
+
+```markdown
+**讨论过程**
+1. 主 Agent 初始判断：...
+2. Claude 第一轮回应：...
+3. 主 Agent 反驳/修正：...
+4. Claude 最终回应：...
+
+**最终结论**
+...
+```
+
+每轮只写 3-5 行要点，不贴完整原文。重点展示双方观点如何变化、哪里达成一致、哪里仍有分歧。
+
+用户可用下面表达控制详细程度：
+
+- “只要结论”：省略 `讨论过程`，只输出最终结论。
+- “展开讨论过程”：输出更详细的每轮摘要。
+- “贴原文”或“贴 Claude 原文”：才输出 Claude 原文的关键摘录；除非用户明确要求，不要全量贴出 Claude 响应。
+
+`ask` 和 `review` 默认不展示推理过程，只输出结论、发现和建议。
 
 ## 仓库和文件安全
 
