@@ -13,7 +13,8 @@ description: Use when the user explicitly asks the current agent to consult Clau
 - 默认不把完整主会话原样转发给 Claude，只传最小必要上下文。
 - 默认不传 `--model`，继承用户当前 Claude CLI 的默认模型。
 - 仅在用户明确指定模型时原样传递 `--model <user_model>`。
-- 优先返回结构化结果，建议使用 `--output-format json`。
+- 所有 Claude 调用必须通过 `scripts/invoke-claude.ps1` 执行，禁止直接调用 `claude -p`。
+- 包装脚本强制使用 `--output-format json`、解析 `session_id` 并自动写入会话索引。
 - 当前宿主 Agent 权限只决定 Claude 可获得的权限上限，不自动把所有请求提升到最高权限。
 - 单次调用 Claude 不构成“讨论”。只有当 Claude 能看到主 Agent 的明确观点，且主 Agent 能看到 Claude 的回应并继续回复时，才算讨论。
 
@@ -66,7 +67,7 @@ description: Use when the user explicitly asks the current agent to consult Clau
 - `debate`：同一场讨论内默认复用第一轮 Claude session；跨主题或新任务时新建 Claude 短会话，避免长期污染。
 - `execute`：默认新建 Claude 短会话，避免执行上下文、工具状态和旧错误污染后续任务。
 
-同一场 `debate` 的第 2 轮和可选第 3 轮默认使用第一轮返回的 `session_id` 执行 `--resume <session_id>`。这样 Claude 能看到完整讨论上下文，同时减少重复 prompt 和会话数量。
+同一场 `debate` 的第 2 轮和可选第 3 轮必须使用第一轮脚本返回的 `session_id` 执行 `--resume <session_id>`。当前调用链直接保存并传递该 ID，不通过索引反查。
 
 用户说“继续刚才的讨论”、“继续上面的”、“你们再讨论下”、“在刚才基础上继续”等表达时，可以自动续接最近一次 `debate` 的 Claude session，但必须同时满足：
 
@@ -83,10 +84,10 @@ description: Use when the user explicitly asks the current agent to consult Clau
 
 维护轻量 JSONL 索引：`<ask-claude skill dir>/.state/sessions.jsonl`。如果宿主平台不允许写入 skill 目录，改用当前工作区的 `.ask-claude/sessions.jsonl`。
 
-每次成功调用 Claude 后，如果返回了 `session_id`，追加一条记录：
+每次成功调用 Claude 后，包装脚本自动追加一条记录：
 
 ```json
-{"session_id":"<uuid>","branch":"ask|review|debate|execute","topic":"<short topic>","cwd":"<cwd>","created_at":"<iso8601>","last_used_at":"<iso8601>","status":"active","prompt_preview":"<first 80 chars>","summary":"<short result summary>"}
+{"session_id":"<uuid>","parent_session_id":"<uuid|null>","branch":"ask|review|debate|execute","topic":"<short topic>","cwd":"<cwd>","created_at":"<iso8601>","last_used_at":"<iso8601>","status":"active","round":1,"resumed":false,"prompt_preview":"<first 80 chars>","summary":"<short result summary>"}
 ```
 
 索引用途只限：
@@ -95,7 +96,20 @@ description: Use when the user explicitly asks the current agent to consult Clau
 - 查找最近一次可续接的 `debate` session。
 - 辅助用户按时间或数量清理历史。
 
-索引不用于普通 `ask`、`review`、`execute` 的自动 resume，不做长期 topic 匹配，不作为主流程依赖。索引写入失败、损坏或拿不到 `session_id` 时，静默跳过记录，不阻断 Claude 调用。
+索引不用于普通 `ask`、`review`、`execute` 的自动 resume，不做长期 topic 匹配，不作为主流程依赖。索引写入失败时，脚本自动回退到当前工作区 `.ask-claude/sessions.jsonl`，并显式返回 `index_recorded`、`index_path` 和 `index_error`，禁止静默跳过。`debate` 第一轮拿不到 `session_id` 时必须停止，不能把后续新会话描述为同一场连续讨论。
+
+## 强制调用流程
+
+1. 使用 `scripts/invoke-claude.ps1` 发起调用。
+2. 从脚本 JSON 输出读取 `result`、`session_id` 和 `index_recorded`。
+3. `debate` 后续轮次把第一轮 `session_id` 原样传给 `-ResumeSessionId`。
+4. `--resume` 失败后才能新建短会话并注入显式摘要；最终结果必须标注“已降级为跨会话讨论”。
+5. Claude 回复偏题时，该轮无效；重试一次，仍失败则停止并报告。
+
+```powershell
+$round1 = .\scripts\invoke-claude.ps1 -Branch debate -Topic '<topic>' -Round 1 -Prompt '<prompt>' | ConvertFrom-Json
+$round2 = .\scripts\invoke-claude.ps1 -Branch debate -Topic '<topic>' -Round 2 -ResumeSessionId $round1.session_id -Prompt '<prompt>' | ConvertFrom-Json
+```
 
 ## 平台适配
 
@@ -109,22 +123,22 @@ description: Use when the user explicitly asks the current agent to consult Clau
 
 ### ask
 
-```bash
-claude -p --output-format json "<prompt>"
+```powershell
+.\scripts\invoke-claude.ps1 -Branch ask -Topic '<topic>' -Prompt '<prompt>'
 ```
 
 ### review
 
-```bash
-claude -p --output-format json --permission-mode default "<prompt>"
+```powershell
+.\scripts\invoke-claude.ps1 -Branch review -Topic '<topic>' -Prompt '<prompt>'
 ```
 
 如果不需要 Claude 自己动工具，进一步限制工具范围。
 
 ### debate
 
-```bash
-claude -p --output-format json --permission-mode default "<prompt>"
+```powershell
+.\scripts\invoke-claude.ps1 -Branch debate -Topic '<topic>' -Round 1 -Prompt '<prompt>'
 ```
 
 `debate` 默认和 `review` 使用同等级权限，重点区别在于它必须是多轮、双向可见的观点交换，而不是一次性征求意见。
@@ -132,8 +146,8 @@ claude -p --output-format json --permission-mode default "<prompt>"
 
 ### execute
 
-```bash
-claude -p --output-format json --permission-mode bypassPermissions "<prompt>"
+```powershell
+.\scripts\invoke-claude.ps1 -Branch execute -Topic '<topic>' -Prompt '<prompt>'
 ```
 
 只有在下面两个条件同时满足时才使用 `execute`：
@@ -266,9 +280,11 @@ Claude 上轮观点摘要：
 - `main_disagreement`
 - `resolution`
 
+如果 `debate` 最终回复缺少固定结构中的任一必需段落，视为本次技能输出不合格。主 Agent 必须先在本地重组回复，再发给用户；不要把缺结构的半成品直接输出。
+
 ### Debate 可见性
 
-`debate` 结果默认不仅输出最终结论，还要输出压缩后的讨论过程。主 Agent 汇报时按下面结构组织：
+`debate` 结果默认不仅输出最终结论，还必须输出压缩后的讨论过程。主 Agent 对用户的最终回复必须使用下面的固定结构，不允许只给结论摘要：
 
 ```markdown
 **讨论过程**
@@ -277,11 +293,28 @@ Claude 上轮观点摘要：
 3. 主 Agent 反驳/修正：...
 4. Claude 最终回应：...
 
+**核心分歧**
+...
+
+**主 Agent 让步点**
+...
+
+**未解决分歧**
+...
+
 **最终结论**
 ...
 ```
 
 每轮只写 3-5 行要点，不贴完整原文。重点展示双方观点如何变化、哪里达成一致、哪里仍有分歧。
+
+即使主 Agent 当前拿不到完整主会话上下文、Claude 原文或某一轮的全部细节，也必须按固定结构输出，并对缺失项明确标注：
+
+- `未获取到该轮原文`
+- `当前上下文不足，以下为压缩重建摘要`
+- `该项未知`
+
+不允许因为上下文不完整就省略 `讨论过程`、`核心分歧`、`主 Agent 让步点`、`未解决分歧` 或 `最终结论` 任一段落。
 
 用户可用下面表达控制详细程度：
 
